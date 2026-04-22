@@ -1,24 +1,4 @@
-"""
-FastAPI YOLO Payment Screen Detector API
-=========================================
-
-Menjalankan deteksi layar HP bukti pembayaran menggunakan:
-- YOLOv8n (cell phone detection)
-- OpenCV quad detection
-- Heuristic payment screen validation
-
-Endpoint:
-POST /detect-payment-screen
-
-Install:
-    pip install fastapi uvicorn python-multipart opencv-python numpy ultralytics
-
-Run:
-    uvicorn detect_api:app --reload --host 0.0.0.0 --port 8000
-"""
-
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 import cv2
@@ -28,7 +8,9 @@ from datetime import datetime
 
 app = FastAPI(title="Payment Screen Detector API")
 
-# WAJIB untuk Next.js frontend
+# =========================
+# CORS
+# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,13 +26,19 @@ print("[YOLO] Loading yolov8n model...")
 model = YOLO("yolov8n.pt")
 print("[YOLO] Model ready")
 
-PHONE_CLASS_ID = 67  # COCO class for cell phone
+PHONE_CLASS_ID = 67
+
+# 🔥 GLOBAL LOCK (ANTI SPAM CAPTURE)
+HAS_CAPTURED = False
 
 
 def ts():
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
+# =========================
+# HELPER
+# =========================
 def order_points(pts):
     pts = pts.reshape(4, 2).astype("float32")
     s = pts.sum(axis=1)
@@ -94,6 +82,9 @@ def four_point_warp(image, pts):
     return warped
 
 
+# =========================
+# SCORING
+# =========================
 def payment_screen_score(crop):
     h, w = crop.shape[:2]
     if h == 0 or w == 0:
@@ -101,58 +92,55 @@ def payment_screen_score(crop):
 
     score = 0.0
 
-    # portrait aspect ratio
     ar = h / max(w, 1)
-    if 1.4 <= ar <= 2.5:
-        score += 0.30
+    if 1.2 <= ar <= 3.0:
+        score += 0.25
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-    # bright UI screen
-    bright_ratio = (gray > 180).mean()
-    if bright_ratio > 0.35:
+    bright_ratio = (gray > 150).mean()
+    if bright_ratio > 0.2:
         score += 0.25
 
-    # text lines
     edges = cv2.Canny(gray, 50, 150)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 1))
-    lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel)
-    line_ratio = lines.sum() / (255 * h * w + 1)
-
-    if line_ratio > 0.001:
+    line_ratio = edges.sum() / (255 * h * w + 1)
+    if line_ratio > 0.0005:
         score += 0.25
 
-    # UI low saturation
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     sat_mean = hsv[:, :, 1].mean()
-    if sat_mean < 60:
-        score += 0.20
+    if sat_mean < 100:
+        score += 0.25
 
     return min(score, 1.0)
 
 
+# =========================
+# YOLO
+# =========================
 def detect_phone_boxes(image):
     results = model(
         image,
         classes=[PHONE_CLASS_ID],
         verbose=False,
-        conf=0.30
+        conf=0.25
     )[0]
 
     boxes = []
 
     for box in results.boxes:
-        conf = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        boxes.append((x1, y1, x2, y2, conf))
+        boxes.append((x1, y1, x2, y2))
 
     return boxes
 
 
+# =========================
+# SCREEN DETECTOR
+# =========================
 def detect_best_screen(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.Canny(gray, 50, 150)
 
     contours, _ = cv2.findContours(
         edges,
@@ -160,20 +148,17 @@ def detect_best_screen(image):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    phone_boxes = detect_phone_boxes(image)
-
     best_crop = None
     best_score = 0.0
 
-    for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
-        area = cv2.contourArea(cnt)
-        if area < 15000:
+    for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:20]:
+        if cv2.contourArea(cnt) < 10000:
             continue
 
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        if len(approx) < 4 or len(approx) > 6:
+        if not (4 <= len(approx) <= 6):
             continue
 
         crop = four_point_warp(image, approx)
@@ -182,91 +167,105 @@ def detect_best_screen(image):
 
         score = payment_screen_score(crop)
 
-        x, y, w, h = cv2.boundingRect(approx)
-
-        # bonus score jika overlap dengan YOLO phone box
-        for bx1, by1, bx2, by2, conf in phone_boxes:
-            ix = max(0, min(x + w, bx2) - max(x, bx1))
-            iy = max(0, min(y + h, by2) - max(y, by1))
-            inter = ix * iy
-            union = (w * h) + ((bx2 - bx1) * (by2 - by1)) - inter
-
-            if union > 0 and (inter / union) > 0.2:
-                score += 0.25
-                break
-
         if score > best_score:
             best_score = score
             best_crop = crop
 
-    return best_crop, min(best_score, 1.0)
+    return best_crop, best_score
 
 
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def root():
     return {"message": "Payment Detector API Running"}
 
 
+# 🔍 DETECT ONLY
 @app.post("/detect-payment-screen")
 async def detect_payment_screen(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        np_arr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        image = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
 
         if image is None:
-            return {
-                "detected": False
-            }
+            return {"detected": False}
 
         crop, score = detect_best_screen(image)
+        phones = detect_phone_boxes(image)
 
-        # ambil phone box dari YOLO
-        phone_boxes = detect_phone_boxes(image)
+        h, w = image.shape[:2]
 
-        if len(phone_boxes) == 0:
-            return {
-                "detected": False,
-                "confidence": 0
-            }
-
-        # ambil box terbesar / terbaik
-        x1, y1, x2, y2, conf = max(
-            phone_boxes,
-            key=lambda x: (x[2] - x[0]) * (x[3] - x[1])
-        )
-
-        if crop is None or score < 0.55:
-            return {
-                "detected": False,
-                "confidence": round(float(score), 2),
-                "box": {
-                    "x": x1,
-                    "y": y1,
-                    "w": x2 - x1,
-                    "h": y2 - y1
-                }
-            }
-
-        filename = f"payment_{ts()}.jpg"
-        save_path = os.path.join(OUTPUT_DIR, filename)
-        cv2.imwrite(save_path, crop)
-
-        return {
-            "detected": True,
-            "confidence": round(float(score), 2),
-            "filename": filename,
-            "path": save_path,
-            "box": {
+        # 🔥 SELALU ADA BOX
+        if len(phones) > 0:
+            x1, y1, x2, y2 = phones[0]
+            box = {
                 "x": x1,
                 "y": y1,
                 "w": x2 - x1,
                 "h": y2 - y1
             }
+        else:
+            # fallback full frame
+            box = {
+                "x": 0,
+                "y": 0,
+                "w": w,
+                "h": h
+            }
+
+        detected = crop is not None and score >= 0.45
+
+        print(f"[DETECT] score={score:.2f} detected={detected}")
+
+        return {
+            "detected": detected,
+            "confidence": round(float(score), 2),
+            "box": box
         }
 
     except Exception as e:
+        print("[ERROR DETECT]", str(e))
+        return {"detected": False}
+
+
+# 📸 CAPTURE ONLY (ANTI SPAM)
+@app.post("/capture-payment")
+async def capture_payment(file: UploadFile = File(...)):
+    global HAS_CAPTURED
+
+    # 🔥 HARD LOCK
+    if HAS_CAPTURED:
+        print("[BLOCKED] Already captured")
+        return {"success": False, "message": "already_captured"}
+
+    try:
+        contents = await file.read()
+        image = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+
+        if image is None:
+            return {"success": False}
+
+        crop, score = detect_best_screen(image)
+
+        final_image = crop if crop is not None else image
+
+        filename = f"payment_{ts()}.jpg"
+        save_path = os.path.join(OUTPUT_DIR, filename)
+
+        cv2.imwrite(save_path, final_image)
+
+        HAS_CAPTURED = True  # 🔥 LOCK SET
+
+        print(f"[CAPTURE] Saved: {filename}")
+
         return {
-            "detected": False,
-            "message": str(e)
+            "success": True,
+            "filename": filename,
+            "confidence": round(float(score), 2)
         }
+
+    except Exception as e:
+        print("[ERROR CAPTURE]", str(e))
+        return {"success": False}
